@@ -119,7 +119,7 @@ pub struct State {
 }
 
 struct NetState {
-    ch: ch::State<MTU, 4, 4>,
+    ch: ch::State<MTU, 1, 1>,
     events: Events,
 }
 

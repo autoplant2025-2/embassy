@@ -5,12 +5,38 @@ use core::task::{Poll, Waker};
 use embassy_sync::waitqueue::WakerRegistration;
 
 use crate::consts::Ioctl;
-use crate::fmt::Bytes;
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IoctlType {
     Get = 0,
     Set = 2,
+}
+
+/// IOCTL Error wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IoctlError {
+    /// Generic IOCTL failure with status code.
+    Status(core::num::NonZeroI32),
+}
+
+impl From<i32> for IoctlError {
+    fn from(status: i32) -> Self {
+        match core::num::NonZeroI32::new(status) {
+            Some(n) => IoctlError::Status(n),
+            // Fallback for 0, although logic shouldn't produce Err(0).
+            None => IoctlError::Status(unsafe { core::num::NonZeroI32::new_unchecked(i32::MAX) }),
+        }
+    }
+}
+
+impl From<IoctlError> for i32 {
+    fn from(e: IoctlError) -> i32 {
+        match e {
+            IoctlError::Status(n) => n.get(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -25,7 +51,7 @@ pub struct PendingIoctl {
 enum IoctlStateInner {
     Pending(PendingIoctl),
     Sent { buf: *mut [u8] },
-    Done { resp_len: usize },
+    Done { result: Result<usize, IoctlError> },
 }
 
 struct Wakers {
@@ -50,7 +76,7 @@ pub struct IoctlState {
 impl IoctlState {
     pub const fn new() -> Self {
         Self {
-            state: Cell::new(IoctlStateInner::Done { resp_len: 0 }),
+            state: Cell::new(IoctlStateInner::Done { result: Ok(0) }),
             wakers: RefCell::new(Wakers::new()),
         }
     }
@@ -71,10 +97,10 @@ impl IoctlState {
         self.wakers.borrow_mut().runner.register(waker);
     }
 
-    pub fn wait_complete(&self) -> impl Future<Output = usize> + '_ {
+    pub fn wait_complete(&self) -> impl Future<Output = Result<usize, IoctlError>> + '_ {
         poll_fn(|cx| {
-            if let IoctlStateInner::Done { resp_len } = self.state.get() {
-                Poll::Ready(resp_len)
+            if let IoctlStateInner::Done { result } = self.state.get() {
+                Poll::Ready(result)
             } else {
                 self.register_control(cx.waker());
                 Poll::Pending
@@ -95,26 +121,37 @@ impl IoctlState {
     }
 
     pub fn cancel_ioctl(&self) {
-        self.state.set(IoctlStateInner::Done { resp_len: 0 });
+        self.state.set(IoctlStateInner::Done { result: Ok(0) });
     }
 
-    pub async fn do_ioctl(&self, kind: IoctlType, cmd: Ioctl, iface: u32, buf: &mut [u8]) -> usize {
+    pub async fn do_ioctl(
+        &self,
+        kind: IoctlType,
+        cmd: Ioctl,
+        iface: u32,
+        buf: &mut [u8],
+    ) -> Result<usize, IoctlError> {
         self.state
             .set(IoctlStateInner::Pending(PendingIoctl { buf, kind, cmd, iface }));
         self.wake_runner();
         self.wait_complete().await
     }
 
-    pub fn ioctl_done(&self, response: &[u8]) {
+    pub fn ioctl_done(&self, response: &[u8], result: Result<(), IoctlError>) {
         if let IoctlStateInner::Sent { buf } = self.state.get() {
-            trace!("IOCTL Response: {:02x}", Bytes(response));
+            // Check that the buffer is valid!
+            let buf = unsafe { &mut *buf };
 
-            // TODO fix this
-            (unsafe { &mut *buf }[..response.len()]).copy_from_slice(response);
+            let result = match result {
+                Ok(()) => {
+                    let len = core::cmp::min(buf.len(), response.len());
+                    buf[..len].copy_from_slice(&response[..len]);
+                    Ok(len)
+                },
+                Err(e) => Err(e),
+            };
 
-            self.state.set(IoctlStateInner::Done {
-                resp_len: response.len(),
-            });
+            self.state.set(IoctlStateInner::Done { result });
             self.wake_control();
         } else {
             warn!("IOCTL Response but no pending Ioctl");

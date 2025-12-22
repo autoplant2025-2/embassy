@@ -125,7 +125,7 @@ pub struct CdcHeader {
     pub len: u32,
     pub flags: u16,
     pub id: u16,
-    pub status: u32,
+    pub status: i32,
 }
 impl_bytes!(CdcHeader);
 
@@ -138,7 +138,7 @@ impl defmt::Format for CdcHeader {
 
         defmt::write!(
             fmt,
-            "CdcHeader{{cmd: {=u32:08x}, len: {=u32:08x}, flags: {=u16:04x}, id: {=u16:04x}, status: {=u32:08x}}}",
+            "CdcHeader{{cmd: {=u32:08x}, len: {=u32:08x}, flags: {=u16:04x}, id: {=u16:04x}, status: {=i32:08x}}}",
             copy(self.cmd),
             copy(self.len),
             copy(self.flags),

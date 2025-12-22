@@ -8,7 +8,7 @@ pub use crate::bus::SpiBusCyw43;
 use crate::consts::*;
 use crate::events::{Event, Events, Status};
 use crate::fmt::Bytes;
-use crate::ioctl::{IoctlState, IoctlType, PendingIoctl};
+use crate::ioctl::{IoctlState, IoctlType, PendingIoctl, IoctlError};
 use crate::nvram::NVRAM;
 use crate::structs::*;
 use crate::util::slice8_mut;
@@ -440,12 +440,8 @@ where
                 trace!("    {:?}", cdc_header);
 
                 if cdc_header.id == self.ioctl_id {
-                    if cdc_header.status != 0 {
-                        // TODO: propagate error instead
-                        panic!("IOCTL error {}", cdc_header.status as i32);
-                    }
-
-                    self.ioctl_state.ioctl_done(response);
+                    let result = if cdc_header.status == 0 { Ok(()) } else { Err(IoctlError::from(cdc_header.status)) };
+                    self.ioctl_state.ioctl_done(response, result);
                 }
             }
             CHANNEL_TYPE_EVENT => {

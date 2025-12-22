@@ -8,7 +8,7 @@ use embassy_time::{Duration, Timer};
 use crate::consts::*;
 use crate::events::{Event, EventSubscriber, Events};
 use crate::fmt::Bytes;
-use crate::ioctl::{IoctlState, IoctlType};
+use crate::ioctl::{IoctlState, IoctlType, IoctlError};
 use crate::structs::*;
 use crate::{PowerManagementMode, countries, events};
 
@@ -22,7 +22,11 @@ pub enum JoinError {
     JoinFailure(u8),
     /// Authentication failure for a secure network.
     AuthenticationFailure,
+    /// IOCTL failure.
+    Ioctl(IoctlError),
 }
+
+
 
 /// Multicast errors.
 #[derive(Debug)]
@@ -31,6 +35,8 @@ pub enum AddMulticastAddressError {
     NotMulticast,
     /// No free address slots.
     NoFreeSlots,
+    /// IOCTL failure.
+    Ioctl(IoctlError),
 }
 
 /// Control driver.
@@ -167,7 +173,7 @@ impl<'a> Control<'a> {
         }
     }
 
-    async fn load_clm(&mut self, clm: &[u8]) {
+    async fn load_clm(&mut self, clm: &[u8]) -> Result<(), IoctlError> {
         const CHUNK_SIZE: usize = 1024;
 
         debug!("Downloading CLM...");
@@ -194,27 +200,28 @@ impl<'a> Control<'a> {
             buf[8..20].copy_from_slice(&header.to_bytes());
             buf[20..][..chunk.len()].copy_from_slice(&chunk);
             self.ioctl(IoctlType::Set, Ioctl::SetVar, 0, &mut buf[..8 + 12 + chunk.len()])
-                .await;
+                .await?;
         }
 
         // check clmload ok
-        assert_eq!(self.get_iovar_u32("clmload_status").await, 0);
+        assert_eq!(self.get_iovar_u32("clmload_status").await?, 0);
+        Ok(())
     }
 
     /// Initialize WiFi controller.
-    pub async fn init(&mut self, clm: &[u8]) {
-        self.load_clm(&clm).await;
+    pub async fn init(&mut self, clm: &[u8]) -> Result<(), IoctlError> {
+        self.load_clm(&clm).await?;
 
         debug!("Configuring misc stuff...");
 
         // Disable tx gloming which transfers multiple packets in one request.
         // 'glom' is short for "conglomerate" which means "gather together into
         // a compact mass".
-        self.set_iovar_u32("bus:txglom", 0).await;
-        self.set_iovar_u32("apsta", 1).await;
+        self.set_iovar_u32("bus:txglom", 0).await?;
+        self.set_iovar_u32("apsta", 1).await?;
 
         // read MAC addr.
-        let mac_addr = self.address().await;
+        let mac_addr = self.address().await?;
         debug!("mac addr: {:02x}", Bytes(&mac_addr));
 
         let country = countries::WORLD_WIDE_XX;
@@ -223,23 +230,23 @@ impl<'a> Control<'a> {
             country_code: [country.code[0], country.code[1], 0, 0],
             rev: if country.rev == 0 { -1 } else { country.rev as _ },
         };
-        self.set_iovar("country", &country_info.to_bytes()).await;
+        self.set_iovar("country", &country_info.to_bytes()).await?;
 
         // set country takes some time, next ioctls fail if we don't wait.
         Timer::after_millis(100).await;
 
         // Set antenna to chip antenna
-        self.ioctl_set_u32(Ioctl::SetAntdiv, 0, 0).await;
+        self.ioctl_set_u32(Ioctl::SetAntdiv, 0, 0).await?;
 
-        self.set_iovar_u32("bus:txglom", 0).await;
+        self.set_iovar_u32("bus:txglom", 0).await?;
         Timer::after_millis(100).await;
-        //self.set_iovar_u32("apsta", 1).await; // this crashes, also we already did it before...??
+        //self.set_iovar_u32("apsta", 1).await?; // this crashes, also we already did it before...??
         //Timer::after_millis(100).await;
-        self.set_iovar_u32("ampdu_ba_wsize", 8).await;
+        self.set_iovar_u32("ampdu_ba_wsize", 8).await?;
         Timer::after_millis(100).await;
-        self.set_iovar_u32("ampdu_mpdu", 4).await;
+        self.set_iovar_u32("ampdu_mpdu", 4).await?;
         Timer::after_millis(100).await;
-        //self.set_iovar_u32("ampdu_rx_factor", 0).await; // this crashes
+        //self.set_iovar_u32("ampdu_rx_factor", 0).await?; // this crashes
 
         //Timer::after_millis(100).await;
 
@@ -258,58 +265,59 @@ impl<'a> Control<'a> {
         evts.unset(Event::PROBRESP_MSG);
         evts.unset(Event::ROAM);
 
-        self.set_iovar("bsscfg:event_msgs", &evts.to_bytes()).await;
+        self.set_iovar("bsscfg:event_msgs", &evts.to_bytes()).await?;
 
         Timer::after_millis(100).await;
 
         // set wifi up
-        self.up().await;
+        self.up().await?;
 
         Timer::after_millis(100).await;
 
-        self.ioctl_set_u32(Ioctl::SetGmode, 0, 1).await; // SET_GMODE = auto
-        self.ioctl_set_u32(Ioctl::SetBand, 0, 0).await; // SET_BAND = any
+        self.ioctl_set_u32(Ioctl::SetGmode, 0, 1).await?; // SET_GMODE = auto
+        self.ioctl_set_u32(Ioctl::SetBand, 0, 0).await?; // SET_BAND = any
 
         Timer::after_millis(100).await;
 
         self.state_ch.set_hardware_address(HardwareAddress::Ethernet(mac_addr));
 
         debug!("cyw43 control init done");
+        Ok(())
     }
 
     /// Set the WiFi interface up.
-    async fn up(&mut self) {
-        self.ioctl(IoctlType::Set, Ioctl::Up, 0, &mut []).await;
+    async fn up(&mut self) -> Result<(), IoctlError> {
+        self.ioctl(IoctlType::Set, Ioctl::Up, 0, &mut []).await.map(|_| ())
     }
 
     /// Set the interface down.
-    async fn down(&mut self) {
-        self.ioctl(IoctlType::Set, Ioctl::Down, 0, &mut []).await;
+    async fn down(&mut self) -> Result<(), IoctlError> {
+        self.ioctl(IoctlType::Set, Ioctl::Down, 0, &mut []).await.map(|_| ())
     }
 
     /// Set power management mode.
-    pub async fn set_power_management(&mut self, mode: PowerManagementMode) {
+    pub async fn set_power_management(&mut self, mode: PowerManagementMode) -> Result<(), IoctlError> {
         // power save mode
         let mode_num = mode.mode();
         if mode_num == 2 {
-            self.set_iovar_u32("pm2_sleep_ret", mode.sleep_ret_ms() as u32).await;
-            self.set_iovar_u32("bcn_li_bcn", mode.beacon_period() as u32).await;
-            self.set_iovar_u32("bcn_li_dtim", mode.dtim_period() as u32).await;
-            self.set_iovar_u32("assoc_listen", mode.assoc() as u32).await;
+            self.set_iovar_u32("pm2_sleep_ret", mode.sleep_ret_ms() as u32).await?;
+            self.set_iovar_u32("bcn_li_bcn", mode.beacon_period() as u32).await?;
+            self.set_iovar_u32("bcn_li_dtim", mode.dtim_period() as u32).await?;
+            self.set_iovar_u32("assoc_listen", mode.assoc() as u32).await?;
         }
-        self.ioctl_set_u32(Ioctl::SetPm, 0, mode_num).await;
+        self.ioctl_set_u32(Ioctl::SetPm, 0, mode_num).await
     }
 
     /// Join a network with the provided SSID using the specified options.
     pub async fn join(&mut self, ssid: &str, options: JoinOptions<'_>) -> Result<(), JoinError> {
-        self.set_iovar_u32("ampdu_ba_wsize", 8).await;
+        self.set_iovar_u32("ampdu_ba_wsize", 8).await.map_err(JoinError::Ioctl)?;
 
         if options.auth == JoinAuth::Open {
-            self.ioctl_set_u32(Ioctl::SetWsec, 0, 0).await;
-            self.set_iovar_u32x2("bsscfg:sup_wpa", 0, 0).await;
-            self.ioctl_set_u32(Ioctl::SetInfra, 0, 1).await;
-            self.ioctl_set_u32(Ioctl::SetAuth, 0, 0).await;
-            self.ioctl_set_u32(Ioctl::SetWpaAuth, 0, WPA_AUTH_DISABLED).await;
+            self.ioctl_set_u32(Ioctl::SetWsec, 0, 0).await.map_err(JoinError::Ioctl)?;
+            self.set_iovar_u32x2("bsscfg:sup_wpa", 0, 0).await.map_err(JoinError::Ioctl)?;
+            self.ioctl_set_u32(Ioctl::SetInfra, 0, 1).await.map_err(JoinError::Ioctl)?;
+            self.ioctl_set_u32(Ioctl::SetAuth, 0, 0).await.map_err(JoinError::Ioctl)?;
+            self.ioctl_set_u32(Ioctl::SetWpaAuth, 0, WPA_AUTH_DISABLED).await.map_err(JoinError::Ioctl)?;
         } else {
             let mut wsec = 0;
             if options.cipher_aes {
@@ -318,11 +326,11 @@ impl<'a> Control<'a> {
             if options.cipher_tkip {
                 wsec |= WSEC_TKIP;
             }
-            self.ioctl_set_u32(Ioctl::SetWsec, 0, wsec).await;
+            self.ioctl_set_u32(Ioctl::SetWsec, 0, wsec).await.map_err(JoinError::Ioctl)?;
 
-            self.set_iovar_u32x2("bsscfg:sup_wpa", 0, 1).await;
-            self.set_iovar_u32x2("bsscfg:sup_wpa2_eapver", 0, 0xFFFF_FFFF).await;
-            self.set_iovar_u32x2("bsscfg:sup_wpa_tmo", 0, 2500).await;
+            self.set_iovar_u32x2("bsscfg:sup_wpa", 0, 1).await.map_err(JoinError::Ioctl)?;
+            self.set_iovar_u32x2("bsscfg:sup_wpa2_eapver", 0, 0xFFFF_FFFF).await.map_err(JoinError::Ioctl)?;
+            self.set_iovar_u32x2("bsscfg:sup_wpa_tmo", 0, 2500).await.map_err(JoinError::Ioctl)?;
 
             Timer::after_millis(100).await;
 
@@ -347,7 +355,8 @@ impl<'a> Control<'a> {
                 pfi.passphrase[..options.passphrase.len()].copy_from_slice(options.passphrase);
                 Timer::after_millis(3).await;
                 self.ioctl(IoctlType::Set, Ioctl::SetWsecPmk, 0, &mut pfi.to_bytes())
-                    .await;
+                    .await
+                    .map_err(JoinError::Ioctl)?;
             }
 
             if wpa3 {
@@ -357,13 +366,13 @@ impl<'a> Control<'a> {
                 };
                 pfi.passphrase[..options.passphrase.len()].copy_from_slice(options.passphrase);
                 Timer::after_millis(3).await;
-                self.set_iovar("sae_password", &pfi.to_bytes()).await;
+                self.set_iovar("sae_password", &pfi.to_bytes()).await.map_err(JoinError::Ioctl)?;
             }
 
-            self.ioctl_set_u32(Ioctl::SetInfra, 0, 1).await;
-            self.ioctl_set_u32(Ioctl::SetAuth, 0, auth).await;
-            self.set_iovar_u32("mfp", mfp).await;
-            self.ioctl_set_u32(Ioctl::SetWpaAuth, 0, wpa_auth).await;
+            self.ioctl_set_u32(Ioctl::SetInfra, 0, 1).await.map_err(JoinError::Ioctl)?;
+            self.ioctl_set_u32(Ioctl::SetAuth, 0, auth).await.map_err(JoinError::Ioctl)?;
+            self.set_iovar_u32("mfp", mfp).await.map_err(JoinError::Ioctl)?;
+            self.ioctl_set_u32(Ioctl::SetWpaAuth, 0, wpa_auth).await.map_err(JoinError::Ioctl)?;
         }
 
         let mut i = SsidInfo {
@@ -382,7 +391,9 @@ impl<'a> Control<'a> {
         // the actual join operation starts here
         // we make sure to enable events before so we don't miss any
 
-        self.ioctl(IoctlType::Set, Ioctl::SetSsid, 0, &mut i.to_bytes()).await;
+        self.ioctl(IoctlType::Set, Ioctl::SetSsid, 0, &mut i.to_bytes())
+            .await
+            .map_err(JoinError::Ioctl)?;
 
         // To complete the join on an open network, we wait for a SET_SSID event with status SUCCESS
         // For secured networks, we wait for a PSK_SUP event with status 6 "UNSOLICITED"
@@ -418,29 +429,30 @@ impl<'a> Control<'a> {
             Err(JoinError::JoinFailure(status)) => debug!("JOIN failed: status={}", status),
             Err(JoinError::NetworkNotFound) => debug!("JOIN failed: network not found"),
             Err(JoinError::AuthenticationFailure) => debug!("JOIN failed: authentication failure"),
+            Err(JoinError::Ioctl(status)) => debug!("JOIN failed: ioctl error status={}", status),
         };
 
         result
     }
 
     /// Set GPIO pin on WiFi chip.
-    pub async fn gpio_set(&mut self, gpio_n: u8, gpio_en: bool) {
+    pub async fn gpio_set(&mut self, gpio_n: u8, gpio_en: bool) -> Result<(), IoctlError> {
         assert!(gpio_n < 3);
         self.set_iovar_u32x2("gpioout", 1 << gpio_n, if gpio_en { 1 << gpio_n } else { 0 })
             .await
     }
 
     /// Start open access point.
-    pub async fn start_ap_open(&mut self, ssid: &str, channel: u8) {
-        self.start_ap(ssid, "", Security::OPEN, channel).await;
+    pub async fn start_ap_open(&mut self, ssid: &str, channel: u8) -> Result<(), IoctlError> {
+        self.start_ap(ssid, "", Security::OPEN, channel).await
     }
 
     /// Start WPA2 protected access point.
-    pub async fn start_ap_wpa2(&mut self, ssid: &str, passphrase: &str, channel: u8) {
-        self.start_ap(ssid, passphrase, Security::WPA2_AES_PSK, channel).await;
+    pub async fn start_ap_wpa2(&mut self, ssid: &str, passphrase: &str, channel: u8) -> Result<(), IoctlError> {
+        self.start_ap(ssid, passphrase, Security::WPA2_AES_PSK, channel).await
     }
 
-    async fn start_ap(&mut self, ssid: &str, passphrase: &str, security: Security, channel: u8) {
+    async fn start_ap(&mut self, ssid: &str, passphrase: &str, security: Security, channel: u8) -> Result<(), IoctlError> {
         if security != Security::OPEN
             && (passphrase.as_bytes().len() < MIN_PSK_LEN || passphrase.as_bytes().len() > MAX_PSK_LEN)
         {
@@ -448,19 +460,19 @@ impl<'a> Control<'a> {
         }
 
         // Temporarily set wifi down
-        self.down().await;
+        self.down().await?;
 
         // Turn off APSTA mode
-        self.set_iovar_u32("apsta", 0).await;
+        self.set_iovar_u32("apsta", 0).await?;
 
         // Set wifi up again
-        self.up().await;
+        self.up().await?;
 
         // Disable authentication
-        self.ioctl_set_u32(Ioctl::SetAuth, 0, AUTH_OPEN).await;
+        self.ioctl_set_u32(Ioctl::SetAuth, 0, AUTH_OPEN).await?;
 
         // Turn on AP mode
-        self.ioctl_set_u32(Ioctl::SetAp, 0, 1).await;
+        self.ioctl_set_u32(Ioctl::SetAp, 0, 1).await?;
 
         // Set SSID
         let mut i = SsidInfoWithIndex {
@@ -471,16 +483,16 @@ impl<'a> Control<'a> {
             },
         };
         i.ssid_info.ssid[..ssid.as_bytes().len()].copy_from_slice(ssid.as_bytes());
-        self.set_iovar("bsscfg:ssid", &i.to_bytes()).await;
+        self.set_iovar("bsscfg:ssid", &i.to_bytes()).await?;
 
         // Set channel number
-        self.ioctl_set_u32(Ioctl::SetChannel, 0, channel as u32).await;
+        self.ioctl_set_u32(Ioctl::SetChannel, 0, channel as u32).await?;
 
         // Set security
-        self.set_iovar_u32x2("bsscfg:wsec", 0, (security as u32) & 0xFF).await;
+        self.set_iovar_u32x2("bsscfg:wsec", 0, (security as u32) & 0xFF).await?;
 
         if security != Security::OPEN {
-            self.set_iovar_u32x2("bsscfg:wpa_auth", 0, 0x0084).await; // wpa_auth = WPA2_AUTH_PSK | WPA_AUTH_PSK
+            self.set_iovar_u32x2("bsscfg:wpa_auth", 0, 0x0084).await?; // wpa_auth = WPA2_AUTH_PSK | WPA_AUTH_PSK
 
             Timer::after_millis(100).await;
 
@@ -492,32 +504,33 @@ impl<'a> Control<'a> {
             };
             pfi.passphrase[..passphrase.as_bytes().len()].copy_from_slice(passphrase.as_bytes());
             self.ioctl(IoctlType::Set, Ioctl::SetWsecPmk, 0, &mut pfi.to_bytes())
-                .await;
+                .await
+                .map(|_| ())?;
         }
 
         // Change mutlicast rate from 1 Mbps to 11 Mbps
-        self.set_iovar_u32("2g_mrate", 11000000 / 500000).await;
+        self.set_iovar_u32("2g_mrate", 11000000 / 500000).await?;
 
         // Start AP
-        self.set_iovar_u32x2("bss", 0, 1).await; // bss = BSS_UP
+        self.set_iovar_u32x2("bss", 0, 1).await
     }
 
     /// Closes access point.
-    pub async fn close_ap(&mut self) {
+    pub async fn close_ap(&mut self) -> Result<(), IoctlError> {
         // Stop AP
-        self.set_iovar_u32x2("bss", 0, 0).await; // bss = BSS_DOWN
+        self.set_iovar_u32x2("bss", 0, 0).await?; // bss = BSS_DOWN
 
         // Turn off AP mode
-        self.ioctl_set_u32(Ioctl::SetAp, 0, 0).await;
+        self.ioctl_set_u32(Ioctl::SetAp, 0, 0).await?;
 
         // Temporarily set wifi down
-        self.down().await;
+        self.down().await?;
 
         // Turn on APSTA mode
-        self.set_iovar_u32("apsta", 1).await;
+        self.set_iovar_u32("apsta", 1).await?;
 
         // Set wifi up again
-        self.up().await;
+        self.up().await
     }
 
     /// Add specified address to the list of hardware addresses the device
@@ -532,7 +545,7 @@ impl<'a> Control<'a> {
         }
 
         let mut buf = [0; 64];
-        self.get_iovar("mcast_list", &mut buf).await;
+        self.get_iovar("mcast_list", &mut buf).await.map_err(AddMulticastAddressError::Ioctl)?;
 
         let n = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         let (used, free) = buf[4..].split_at_mut(n * 6);
@@ -549,14 +562,14 @@ impl<'a> Control<'a> {
         let n = n + 1;
         buf[..4].copy_from_slice(&(n as u32).to_le_bytes());
 
-        self.set_iovar_v::<80>("mcast_list", &buf).await;
+        self.set_iovar_v::<80>("mcast_list", &buf).await.map_err(AddMulticastAddressError::Ioctl)?;
         Ok(n)
     }
 
     /// Retrieve the list of configured multicast hardware addresses.
-    pub async fn list_multicast_addresses(&mut self, result: &mut [[u8; 6]; 10]) -> usize {
+    pub async fn list_multicast_addresses(&mut self, result: &mut [[u8; 6]; 10]) -> Result<usize, IoctlError> {
         let mut buf = [0; 64];
-        self.get_iovar("mcast_list", &mut buf).await;
+        self.get_iovar("mcast_list", &mut buf).await?;
 
         let n = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         let used = &buf[4..][..n * 6];
@@ -565,40 +578,40 @@ impl<'a> Control<'a> {
             output.copy_from_slice(addr)
         }
 
-        n
+        Ok(n)
     }
 
     /// Retrieve the latest RSSI value
-    pub async fn get_rssi(&mut self) -> i32 {
+    pub async fn get_rssi(&mut self) -> Result<i32, IoctlError> {
         let mut rssi_buf = [0u8; 4];
-        let n = self.ioctl(IoctlType::Get, Ioctl::GetRssi, 0, &mut rssi_buf).await;
+        let n = self.ioctl(IoctlType::Get, Ioctl::GetRssi, 0, &mut rssi_buf).await?;
         assert_eq!(n, 4);
-        i32::from_ne_bytes(rssi_buf)
+        Ok(i32::from_ne_bytes(rssi_buf))
     }
 
-    async fn set_iovar_u32x2(&mut self, name: &str, val1: u32, val2: u32) {
+    async fn set_iovar_u32x2(&mut self, name: &str, val1: u32, val2: u32) -> Result<(), IoctlError> {
         let mut buf = [0; 8];
         buf[0..4].copy_from_slice(&val1.to_le_bytes());
         buf[4..8].copy_from_slice(&val2.to_le_bytes());
         self.set_iovar(name, &buf).await
     }
 
-    async fn set_iovar_u32(&mut self, name: &str, val: u32) {
+    async fn set_iovar_u32(&mut self, name: &str, val: u32) -> Result<(), IoctlError> {
         self.set_iovar(name, &val.to_le_bytes()).await
     }
 
-    async fn get_iovar_u32(&mut self, name: &str) -> u32 {
+    async fn get_iovar_u32(&mut self, name: &str) -> Result<u32, IoctlError> {
         let mut buf = [0; 4];
-        let len = self.get_iovar(name, &mut buf).await;
+        let len = self.get_iovar(name, &mut buf).await?;
         assert_eq!(len, 4);
-        u32::from_le_bytes(buf)
+        Ok(u32::from_le_bytes(buf))
     }
 
-    async fn set_iovar(&mut self, name: &str, val: &[u8]) {
+    async fn set_iovar(&mut self, name: &str, val: &[u8]) -> Result<(), IoctlError> {
         self.set_iovar_v::<196>(name, val).await
     }
 
-    async fn set_iovar_v<const BUFSIZE: usize>(&mut self, name: &str, val: &[u8]) {
+    async fn set_iovar_v<const BUFSIZE: usize>(&mut self, name: &str, val: &[u8]) -> Result<(), IoctlError> {
         debug!("iovar set {} = {:02x}", name, Bytes(val));
 
         let mut buf = [0; BUFSIZE];
@@ -608,11 +621,12 @@ impl<'a> Control<'a> {
 
         let total_len = name.len() + 1 + val.len();
         self.ioctl_inner(IoctlType::Set, Ioctl::SetVar, 0, &mut buf[..total_len])
-            .await;
+            .await
+            .map(|_| ())
     }
 
     // TODO this is not really working, it always returns all zeros.
-    async fn get_iovar(&mut self, name: &str, res: &mut [u8]) -> usize {
+    async fn get_iovar(&mut self, name: &str, res: &mut [u8]) -> Result<usize, IoctlError> {
         debug!("iovar get {}", name);
 
         let mut buf = [0; 64];
@@ -622,27 +636,26 @@ impl<'a> Control<'a> {
         let total_len = max(name.len() + 1, res.len());
         let res_len = self
             .ioctl_inner(IoctlType::Get, Ioctl::GetVar, 0, &mut buf[..total_len])
-            .await;
+            .await?;
 
         let out_len = min(res.len(), res_len);
         res[..out_len].copy_from_slice(&buf[..out_len]);
-        out_len
+        Ok(out_len)
     }
 
-    async fn ioctl_set_u32(&mut self, cmd: Ioctl, iface: u32, val: u32) {
+    async fn ioctl_set_u32(&mut self, cmd: Ioctl, iface: u32, val: u32) -> Result<(), IoctlError> {
         let mut buf = val.to_le_bytes();
-        self.ioctl(IoctlType::Set, cmd, iface, &mut buf).await;
+        self.ioctl(IoctlType::Set, cmd, iface, &mut buf).await.map(|_| ())
     }
 
-    async fn ioctl(&mut self, kind: IoctlType, cmd: Ioctl, iface: u32, buf: &mut [u8]) -> usize {
+    async fn ioctl(&mut self, kind: IoctlType, cmd: Ioctl, iface: u32, buf: &mut [u8]) -> Result<usize, IoctlError> {
         if kind == IoctlType::Set {
             debug!("ioctl set {:?} iface {} = {:02x}", cmd, iface, Bytes(buf));
         }
-        let n = self.ioctl_inner(kind, cmd, iface, buf).await;
-        n
+        self.ioctl_inner(kind, cmd, iface, buf).await
     }
 
-    async fn ioctl_inner(&mut self, kind: IoctlType, cmd: Ioctl, iface: u32, buf: &mut [u8]) -> usize {
+    async fn ioctl_inner(&mut self, kind: IoctlType, cmd: Ioctl, iface: u32, buf: &mut [u8]) -> Result<usize, IoctlError> {
         struct CancelOnDrop<'a>(&'a IoctlState);
 
         impl CancelOnDrop<'_> {
@@ -671,7 +684,7 @@ impl<'a> Control<'a> {
     /// # Note
     /// Device events are currently implemented using a bounded queue.
     /// To not miss any events, you should make sure to always await the stream.
-    pub async fn scan(&mut self, scan_opts: ScanOptions) -> Scanner<'_> {
+    pub async fn scan(&mut self, scan_opts: ScanOptions) -> Result<Scanner<'_>, IoctlError> {
         const SCANTYPE_ACTIVE: u8 = 0;
         const SCANTYPE_PASSIVE: u8 = 1;
 
@@ -725,24 +738,25 @@ impl<'a> Control<'a> {
 
         self.events.mask.enable(&[Event::ESCAN_RESULT]);
         let subscriber = self.events.queue.subscriber().unwrap();
-        self.set_iovar_v::<256>("escan", &scan_params.to_bytes()).await;
+        self.set_iovar_v::<256>("escan", &scan_params.to_bytes()).await?;
 
-        Scanner {
+        Ok(Scanner {
             subscriber,
             events: &self.events,
-        }
+        })
     }
     /// Leave the wifi, with which we are currently associated.
-    pub async fn leave(&mut self) {
-        self.ioctl(IoctlType::Set, Ioctl::Disassoc, 0, &mut []).await;
-        info!("Disassociated")
+    pub async fn leave(&mut self) -> Result<(), IoctlError> {
+        self.ioctl(IoctlType::Set, Ioctl::Disassoc, 0, &mut []).await.map(|_| ())?;
+        info!("Disassociated");
+        Ok(())
     }
 
     /// Gets the MAC address of the device
-    pub async fn address(&mut self) -> [u8; 6] {
+    pub async fn address(&mut self) -> Result<[u8; 6], IoctlError> {
         let mut mac_addr = [0; 6];
-        assert_eq!(self.get_iovar("cur_etheraddr", &mut mac_addr).await, 6);
-        mac_addr
+        assert_eq!(self.get_iovar("cur_etheraddr", &mut mac_addr).await?, 6);
+        Ok(mac_addr)
     }
 }
 
